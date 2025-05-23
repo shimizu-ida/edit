@@ -1,5 +1,7 @@
 // Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
+// MITライセンスに基づきライセンスされています。
 
 #![feature(let_chains, linked_list_cursors, os_string_truncate, string_from_utf8_lossy_owned)]
 
@@ -58,10 +60,13 @@ fn main() -> process::ExitCode {
 
 fn run() -> apperr::Result<()> {
     // Init `sys` first, as everything else may depend on its functionality (IO, function pointers, etc.).
+    // まず `sys` を初期化します。他のすべてがその機能 (IO、関数ポインタなど) に依存する可能性があるためです。
     let _sys_deinit = sys::init()?;
     // Next init `arena`, so that `scratch_arena` works. `loc` depends on it.
+    // 次に `arena` を初期化し、`scratch_arena` が機能するようにします。`loc` はそれに依存します。
     arena::init(SCRATCH_ARENA_CAPACITY)?;
     // Init the `loc` module, so that error messages are localized.
+    // `loc` モジュールを初期化し、エラーメッセージがローカライズされるようにします。
     localization::init();
 
     let mut state = State::new()?;
@@ -70,9 +75,13 @@ fn run() -> apperr::Result<()> {
     }
 
     // sys::init() will switch the terminal to raw mode which prevents the user from pressing Ctrl+C.
+    // sys::init() は端末をrawモードに切り替え、ユーザーがCtrl+Cを押すのを防ぎます。
     // Since the `read_file` call may hang for some reason, we must only call this afterwards.
+    // `read_file` の呼び出しは何らかの理由でハングする可能性があるため、これはその後でのみ呼び出す必要があります。
     // `set_modes()` will enable mouse mode which is equally annoying to switch out for users
     // and so we do it afterwards, for similar reasons.
+    // `set_modes()` はマウスモードを有効にしますが、これもユーザーにとっては切り替えが同様に煩わしいため、
+    // 同様の理由でその後に行います。
     sys::switch_modes()?;
 
     let mut vt_parser = vt::Parser::new();
@@ -113,6 +122,7 @@ fn run() -> apperr::Result<()> {
         let mut passes;
 
         // Process a batch of input.
+        // 入力のバッチを処理します。
         {
             let scratch = scratch_arena(None);
             let read_timeout = vt_parser.read_timeout().min(tui.read_timeout());
@@ -146,7 +156,9 @@ fn run() -> apperr::Result<()> {
         }
 
         // Continue rendering until the layout has settled.
+        // レイアウトが安定するまでレンダリングを続けます。
         // This can take >1 frame, if the input focus is tossed between different controls.
+        // 入力フォーカスが異なるコントロール間で移動する場合、これには1フレーム以上かかることがあります。
         while tui.needs_settling() {
             let mut ctx = tui.create_context(None);
 
@@ -169,6 +181,7 @@ fn run() -> apperr::Result<()> {
         }
 
         // Render the UI and write it to the terminal.
+        // UIをレンダリングし、端末に書き込みます。
         {
             let scratch = scratch_arena(None);
             let mut output = tui.render(&scratch);
@@ -188,6 +201,7 @@ fn run() -> apperr::Result<()> {
             #[cfg(feature = "debug-latency")]
             {
                 // Print the number of passes and latency in the top right corner.
+                // 右上隅にパス数とレイテンシを表示します。
                 let time_end = std::time::Instant::now();
                 let status = time_end - time_beg;
 
@@ -201,17 +215,23 @@ fn run() -> apperr::Result<()> {
                 );
 
                 // "μs" is 3 bytes and 2 columns.
+                // "μs" は 3 バイトで 2 カラムです。
                 let cols = status.len() as i32 - 3 + 2;
 
                 // Since the status may shrink and grow, we may have to overwrite the previous one with whitespace.
+                // ステータスは縮小したり拡大したりする可能性があるため、前のステータスを空白で上書きする必要がある場合があります。
                 let padding = (last_latency_width - cols).max(0);
 
                 // If the `output` is already very large,
                 // Rust may double the size during the write below.
                 // Let's avoid that by reserving the needed size in advance.
+                // `output` がすでに非常に大きい場合、
+                // Rust は以下の書き込み中にサイズを2倍にする可能性があります。
+                // 事前に必要なサイズを予約することで、これを回避しましょう。
                 output.reserve_exact(128);
 
                 // To avoid moving the cursor, push and pop it onto the VT cursor stack.
+                // カーソルを移動させないように、VTカーソルスタックにプッシュおよびポップします。
                 _ = write!(
                     output,
                     "\x1b7\x1b[0;41;97m\x1b[1;{0}H{1:2$}{3}\x1b8",
@@ -232,11 +252,13 @@ fn run() -> apperr::Result<()> {
 }
 
 // Returns true if the application should exit early.
+// アプリケーションが早期に終了すべき場合に true を返します。
 fn handle_args(state: &mut State) -> apperr::Result<bool> {
     let mut cwd = env::current_dir()?;
     let mut path = None;
 
     // The best CLI argument parser in the world.
+    // 世界最高のCLI引数パーサー。
     if let Some(arg) = env::args_os().nth(1) {
         if arg == "-h" || arg == "--help" || (cfg!(windows) && arg == "/?") {
             print_help();
@@ -246,6 +268,7 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
             return Ok(true);
         } else if arg == "-" {
             // We'll check for a redirected stdin no matter what, so we can just ignore "-".
+            // いずれにしてもリダイレクトされた標準入力を確認するので、"-" は無視してかまいません。
         } else {
             let p = cwd.join(Path::new(&arg));
             let p = path::normalize(&p);
@@ -322,6 +345,7 @@ fn draw(ctx: &mut Context, state: &mut State) {
 
     if let Some(key) = ctx.keyboard_input() {
         // Shortcuts that are not handled as part of the textarea, etc.
+        // textare など一部として処理されないショートカット。
 
         if key == kbmod::CTRL | vk::N {
             draw_add_untitled_document(ctx, state);
@@ -350,6 +374,7 @@ fn draw(ctx: &mut Context, state: &mut State) {
         }
 
         // All of the above shortcuts happen to require a rerender.
+        // 上記のショートカットはすべて再レンダリングが必要です。
         ctx.needs_rerender();
         ctx.set_input_consumed();
     }
@@ -474,9 +499,13 @@ fn write_osc_clipboard(output: &mut ArenaString, state: &mut State, tui: &Tui) {
     let clipboard = tui.clipboard();
     if !clipboard.is_empty() {
         // Rust doubles the size of a string when it needs to grow it.
+        // Rust は文字列を拡張する必要がある場合、そのサイズを2倍にします。
         // If `clipboard` is *really* large, this may then double
         // the size of the `output` from e.g. 100MB to 200MB. Not good.
+        // `clipboard` が非常に大きい場合、これにより `output` のサイズが
+        // 例えば 100MB から 200MB に2倍になる可能性があります。これは良くありません。
         // We can avoid that by reserving the needed size in advance.
+        // 事前に必要なサイズを予約することで、これを回避できます。
         output.reserve_exact(base64::encode_len(clipboard.len()) + 16);
         output.push_str("\x1b]52;c;");
         base64::encode(output, clipboard);
@@ -490,7 +519,9 @@ struct RestoreModes;
 impl Drop for RestoreModes {
     fn drop(&mut self) {
         // Same as in the beginning but in the reverse order.
+        // 最初と同じですが、逆の順序です。
         // It also includes DECSCUSR 0 to reset the cursor style and DECTCEM to show the cursor.
+        // また、カーソルスタイルをリセットするための DECSCUSR 0 とカーソルを表示するための DECTCEM も含まれます。
         sys::write_stdout(
             "\x1b[0 q\x1b[?25h\x1b]0;\x07\x1b[?1036l\x1b[?1002;1006;2004l\x1b[?1049l",
         );
@@ -500,21 +531,33 @@ impl Drop for RestoreModes {
 fn setup_terminal(tui: &mut Tui, vt_parser: &mut vt::Parser) -> RestoreModes {
     sys::write_stdout(concat!(
         // 1049: Alternative Screen Buffer
+        // 1049: 代替スクリーンバッファ
         //   I put the ASB switch in the beginning, just in case the terminal performs
         //   some additional state tracking beyond the modes we enable/disable.
+        //   端末が有効/無効にするモードを超えて追加の状態追跡を実行する場合に備えて、
+        //   ASBスイッチを最初に配置しました。
         // 1002: Cell Motion Mouse Tracking
+        // 1002: セルモーションマウストラッキング
         // 1006: SGR Mouse Mode
+        // 1006: SGRマウスモード
         // 2004: Bracketed Paste Mode
+        // 2004: ブラケットペーストモード
         // 1036: Xterm: "meta sends escape" (Alt keypresses should be encoded with ESC + char)
+        // 1036: Xterm: "meta sends escape" (Altキー押下はESC +文字でエンコードする必要があります)
         "\x1b[?1049h\x1b[?1002;1006;2004h\x1b[?1036h",
         // OSC 4 color table requests for indices 0 through 15 (base colors).
+        // インデックス0から15 (基本色) のOSC 4カラーテーブル要求。
         "\x1b]4;0;?;1;?;2;?;3;?;4;?;5;?;6;?;7;?\x07",
         "\x1b]4;8;?;9;?;10;?;11;?;12;?;13;?;14;?;15;?\x07",
         // OSC 10 and 11 queries for the current foreground and background colors.
+        // 現在の前景色と背景色のOSC 10および11クエリ。
         "\x1b]10;?\x07\x1b]11;?\x07",
         // CSI c reports the terminal capabilities.
+        // CSI c は端末の機能を報告します。
         // It also helps us to detect the end of the responses, because not all
         // terminals support the OSC queries, but all of them support CSI c.
+        // すべての端末がOSCクエリをサポートしているわけではありませんが、すべてCSI cをサポートしているため、
+        // これにより応答の終わりを検出するのにも役立ちます。
         "\x1b[c",
     ));
 
@@ -547,13 +590,16 @@ fn setup_terminal(tui: &mut Tui, vt_parser: &mut vt::Parser) -> RestoreModes {
 
                     let color = match splits.next().unwrap_or("") {
                         // The response is `4;<color>;rgb:<r>/<g>/<b>`.
+                        // 応答は `4;<color>;rgb:<r>/<g>/<b>` です。
                         "4" => match splits.next().unwrap_or("").parse::<usize>() {
                             Ok(val) if val < 16 => &mut indexed_colors[val],
                             _ => continue,
                         },
                         // The response is `10;rgb:<r>/<g>/<b>`.
+                        // 応答は `10;rgb:<r>/<g>/<b>` です。
                         "10" => &mut indexed_colors[IndexedColor::Foreground as usize],
                         // The response is `11;rgb:<r>/<g>/<b>`.
+                        // 応答は `11;rgb:<r>/<g>/<b>` です。
                         "11" => &mut indexed_colors[IndexedColor::Background as usize],
                         _ => continue,
                     };
@@ -574,6 +620,7 @@ fn setup_terminal(tui: &mut Tui, vt_parser: &mut vt::Parser) -> RestoreModes {
                             };
                             if part.len() == 4 {
                                 // Round from 16 bits to 8 bits.
+                                // 16ビットから8ビットに丸めます。
                                 val = (val * 0xff + 0x7fff) / 0xffff;
                             }
                             rgb = (rgb >> 8) | ((val as u32) << 16);
@@ -597,13 +644,17 @@ fn setup_terminal(tui: &mut Tui, vt_parser: &mut vt::Parser) -> RestoreModes {
 }
 
 /// Strips all C0 control characters from the string and replaces them with "_".
+/// 文字列からすべてのC0制御文字を取り除き、"_"に置き換えます。
 ///
 /// Jury is still out on whether this should also strip C1 control characters.
+/// これがC1制御文字も取り除くべきかどうかについては、まだ結論が出ていません。
 /// That requires parsing UTF8 codepoints, which is annoying.
+/// それにはUTF8コードポイントの解析が必要であり、これは面倒です。
 fn sanitize_control_chars(text: &str) -> Cow<'_, str> {
     if let Some(off) = text.bytes().position(|b| (..0x20).contains(&b)) {
         let mut sanitized = text.to_string();
         // SAFETY: We only search for ASCII and replace it with ASCII.
+        // 安全性: ASCII文字のみを検索し、ASCII文字に置き換えます。
         let vec = unsafe { sanitized.as_bytes_mut() };
 
         for i in &mut vec[off..] {
