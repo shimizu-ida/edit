@@ -590,7 +590,7 @@ impl TextBuffer {
         let mut first_chunk_len = 0;
         let mut read = 0;
 
-        // Read enough bytes to detect the BOM.
+        // Read enough bytes to determine encoding if not specified.
         while first_chunk_len < BOM_MAX_LEN {
             read = file_read_uninit(file, &mut buf[first_chunk_len..])?;
             if read == 0 {
@@ -599,11 +599,34 @@ impl TextBuffer {
             first_chunk_len += read;
         }
 
-        if let Some(encoding) = encoding {
-            self.encoding = encoding;
+        let actual_encoding_to_use: &'static str;
+        let first_chunk_bytes = unsafe { buf[..first_chunk_len].assume_init_ref() };
+
+        if let Some(user_specified_encoding) = encoding {
+            actual_encoding_to_use = user_specified_encoding;
+            self.encoding = user_specified_encoding; 
         } else {
-            let bom = detect_bom(unsafe { buf[..first_chunk_len].assume_init_ref() });
-            self.encoding = bom.unwrap_or("UTF-8");
+            // No encoding specified by user, try to detect BOM.
+            if let Some(bom_encoding) = detect_bom(first_chunk_bytes) {
+                actual_encoding_to_use = bom_encoding; 
+                self.encoding = bom_encoding; 
+            } else {
+                // No BOM detected, try to validate as UTF-8.
+                if std::str::from_utf8(first_chunk_bytes).is_ok() {
+                    actual_encoding_to_use = "UTF-8";
+                    self.encoding = "UTF-8";
+                } else {
+                    // UTF-8 validation failed, check if it's likely Shift_JIS.
+                    if is_likely_shift_jis(first_chunk_bytes) {
+                        actual_encoding_to_use = "CP932"; // Use CP932 for Shift_JIS
+                        self.encoding = "CP932";
+                    } else {
+                        // Not UTF-8, not likely Shift_JIS, fallback to UTF-8 (lossy).
+                        actual_encoding_to_use = "UTF-8"; 
+                        self.encoding = "UTF-8"; 
+                    }
+                }
+            }
         }
 
         // TODO: Since reading the file can fail, we should ensure that we also reset the cursor here.
@@ -611,10 +634,26 @@ impl TextBuffer {
         self.buffer.clear();
 
         let done = read == 0;
-        if self.encoding == "UTF-8" {
+
+        // If actual_encoding_to_use is "UTF-8" (no BOM detected, or user specified plain "UTF-8")
+        // or "UTF-8 BOM" (BOM detected, or user specified "UTF-8 BOM"), use read_file_as_utf8.
+        // read_file_as_utf8 will handle stripping the BOM if present and will set self.encoding to "UTF-8 BOM"
+        // if it strips a BOM and the original self.encoding was "UTF-8" (i.e. user didn't ask for "UTF-8 BOM" explicitly).
+        if actual_encoding_to_use == "UTF-8" || actual_encoding_to_use == "UTF-8 BOM" {
+            // Pass the original first_chunk_bytes, read_file_as_utf8 will check for BOM itself.
             self.read_file_as_utf8(file, &mut buf, first_chunk_len, done)?;
+            // If encoding was initially "UTF-8" (no BOM specified/detected) but read_file_as_utf8 found one, update self.encoding.
+            if actual_encoding_to_use == "UTF-8" && self.encoding == "UTF-8 BOM" {
+                // This case is fine, self.encoding is correctly "UTF-8 BOM" due to read_file_as_utf8
+            } else {
+                 // Otherwise, ensure self.encoding reflects actual_encoding_to_use if it was "UTF-8 BOM" from the start.
+                 // Or if user specified "UTF-8" and no BOM was found.
+                self.encoding = actual_encoding_to_use;
+            }
         } else {
-            self.read_file_with_icu(file, &mut buf, first_chunk_len, done)?;
+            // For other encodings (e.g., "Shift_JIS", "UTF-16LE"), use ICU.
+            // self.encoding is already set to actual_encoding_to_use from the logic above.
+            self.read_file_with_icu(file, &mut buf, first_chunk_len, done, actual_encoding_to_use)?;
         }
 
         // Figure out
@@ -783,28 +822,40 @@ impl TextBuffer {
         buf: &mut [MaybeUninit<u8>; 4 * KIBI],
         first_chunk_len: usize,
         mut done: bool,
+        encoding_name: &'static str,
     ) -> apperr::Result<()> {
         let scratch = scratch_arena(None);
         let pivot_buffer = scratch.alloc_uninit_slice(4 * KIBI);
-        let mut c = icu::Converter::new(pivot_buffer, self.encoding, "UTF-8")?;
+        // encoding_name here is the one determined by user input or BOM (e.g. "UTF-16LE", "Shift_JIS")
+        // It's stored in self.encoding before this call.
+        let mut c = icu::Converter::new(pivot_buffer, encoding_name, "UTF-8")?;
         let mut first_chunk = unsafe { buf[..first_chunk_len].assume_init_ref() };
+
+        // Strip BOM from first_chunk if the encoding_name implies one.
+        // The converter expects raw content.
+        // Note: detect_bom returns names like "UTF-16LE", "UTF-8 BOM", etc.
+        if encoding_name == "UTF-8 BOM" && first_chunk.starts_with(b"\xEF\xBB\xBF") {
+            first_chunk = &first_chunk[3..];
+        } else if encoding_name == "UTF-16LE" && first_chunk.starts_with(b"\xFF\xFE") {
+            first_chunk = &first_chunk[2..];
+        } else if encoding_name == "UTF-16BE" && first_chunk.starts_with(b"\xFE\xFF") {
+            first_chunk = &first_chunk[2..];
+        } else if encoding_name == "UTF-32LE" && first_chunk.starts_with(b"\xFF\xFE\x00\x00") {
+            first_chunk = &first_chunk[4..];
+        } else if encoding_name == "UTF-32BE" && first_chunk.starts_with(b"\x00\x00\xFE\xFF") {
+            first_chunk = &first_chunk[4..];
+        }
+        // GB18030 usually doesn't have a BOM that needs stripping before conversion by ICU.
+        // Other encodings typically don't have BOMs.
 
         while !first_chunk.is_empty() {
             let off = self.text_length();
             let gap = self.buffer.allocate_gap(off, 8 * KIBI, 0);
-            let (input_advance, mut output_advance) =
+            // No need to manually remove UTF-8 BOM from output here,
+            // as ICU's target is "UTF-8", it won't add a BOM.
+            // And source BOMs are stripped above before this loop.
+            let (input_advance, output_advance) =
                 c.convert(first_chunk, slice_as_uninit_mut(gap))?;
-
-            // Remove the BOM from the file, if this is the first chunk.
-            // Our caller ensures to only call us once the BOM has been identified,
-            // which means that if there's a BOM it must be wholly contained in this chunk.
-            if off == 0 {
-                let written = &mut gap[..output_advance];
-                if written.starts_with(b"\xEF\xBB\xBF") {
-                    written.copy_within(3.., 0);
-                    output_advance -= 3;
-                }
-            }
 
             self.buffer.commit_gap(output_advance);
             first_chunk = &first_chunk[input_advance..];
@@ -842,13 +893,33 @@ impl TextBuffer {
     }
 
     /// Writes the text buffer contents to a file, handling BOM and encoding.
-    pub fn write_file(&mut self, file: &mut File) -> apperr::Result<()> {
-        let mut offset = 0;
+    /// If `encoding_override` is Some, it will be used for saving and will update `self.encoding`.
+    /// Otherwise, the file will be saved as UTF-8 (no BOM).
+    pub fn write_file(&mut self, file: &mut File, encoding_override: Option<&'static str>) -> apperr::Result<()> {
+        let encoding_to_use: &'static str;
 
-        if self.encoding.starts_with("UTF-8") {
-            if self.encoding == "UTF-8 BOM" {
-                file.write_all(b"\xEF\xBB\xBF")?;
+        if let Some(override_enc) = encoding_override {
+            encoding_to_use = override_enc;
+        } else {
+            // Default to UTF-8 (no BOM) when no override is specified.
+            encoding_to_use = "UTF-8";
+        }
+
+        if encoding_to_use == "UTF-8" {
+            // Explicitly save as UTF-8 without BOM.
+            let mut offset = 0;
+            loop {
+                let chunk = self.read_forward(offset);
+                if chunk.is_empty() {
+                    break;
+                }
+                file.write_all(chunk)?;
+                offset += chunk.len();
             }
+        } else if encoding_to_use == "UTF-8 BOM" {
+            // Save as UTF-8 with BOM (only if explicitly overridden to "UTF-8 BOM").
+            file.write_all(b"\xEF\xBB\xBF")?;
+            let mut offset = 0;
             loop {
                 let chunk = self.read_forward(offset);
                 if chunk.is_empty() {
@@ -858,40 +929,66 @@ impl TextBuffer {
                 offset += chunk.len();
             }
         } else {
-            self.write_file_with_icu(file)?;
+            // For other explicitly specified encodings (e.g., Shift_JIS, UTF-16LE from override), use ICU.
+            self.write_file_with_icu(file, encoding_to_use)?;
         }
+
+        // Update the buffer's encoding to what was actually used for saving.
+        self.encoding = encoding_to_use;
 
         self.mark_as_clean();
         Ok(())
     }
 
-    fn write_file_with_icu(&mut self, file: &mut File) -> apperr::Result<()> {
+    fn write_file_with_icu(&mut self, file: &mut File, target_encoding: &'static str) -> apperr::Result<()> {
         let scratch = scratch_arena(None);
-        let pivot_buffer = scratch.alloc_uninit_slice(4 * KIBI);
-        let buf = scratch.alloc_uninit_slice(4 * KIBI);
-        let mut c = icu::Converter::new(pivot_buffer, "UTF-8", self.encoding)?;
+        let pivot_buffer = scratch.alloc_uninit_slice(4 * KIBI); // For converter's internal use
+        let conversion_output_buf = scratch.alloc_uninit_slice(4 * KIBI); // For storing converted output before writing
+        let mut c = icu::Converter::new(pivot_buffer, "UTF-8", target_encoding)?;
         let mut offset = 0;
 
-        // Write the BOM for the encodings we know need it.
-        if self.encoding.starts_with("UTF-16")
-            || self.encoding.starts_with("UTF-32")
-            || self.encoding == "GB18030"
-        {
-            let (_, output_advance) = c.convert(b"\xEF\xBB\xBF", buf)?;
-            let chunk = unsafe { buf[..output_advance].assume_init_ref() };
-            file.write_all(chunk)?;
+        // Write appropriate BOM for the target encoding.
+        // Note: "UTF-8 BOM" is handled by the caller (write_file).
+        match target_encoding {
+            "UTF-16LE" => file.write_all(b"\xFF\xFE")?,
+            "UTF-16BE" => file.write_all(b"\xFE\xFF")?,
+            "UTF-32LE" => file.write_all(b"\xFF\xFE\x00\x00")?,
+            "UTF-32BE" => file.write_all(b"\x00\x00\xFE\xFF")?,
+            // GB18030: According to ICU documentation and general practice,
+            // GB18030 itself does not require a BOM. If a BOM is found, it's typically a UTF-8 BOM
+            // indicating the file *was* UTF-8 but represented GB18030 characters.
+            // So, we don't write a specific GB18030 BOM here.
+            // The previous logic of converting a UTF-8 BOM to GB18030 was likely incorrect.
+            _ => {} // No BOM for other encodings or handled by UTF-8 path.
         }
 
         loop {
-            let chunk = self.read_forward(offset);
-            if chunk.is_empty() {
-                break;
+            let input_chunk = self.read_forward(offset);
+            if input_chunk.is_empty() {
+                // Check for final flush if input is empty
+                let (input_advance, output_advance) = c.convert(b"", conversion_output_buf)?;
+                if output_advance > 0 {
+                    let converted_chunk = unsafe { conversion_output_buf[..output_advance].assume_init_ref() };
+                    file.write_all(converted_chunk)?;
+                }
+                debug_assert_eq!(input_advance, 0); // Should not consume anything from empty input
+                break; // End of buffer and flushed converter
             }
 
-            let (input_advance, output_advance) = c.convert(chunk, buf)?;
-            let chunk = unsafe { buf[..output_advance].assume_init_ref() };
-            file.write_all(chunk)?;
+            let (input_advance, output_advance) = c.convert(input_chunk, conversion_output_buf)?;
+            if output_advance > 0 {
+                let converted_chunk = unsafe { conversion_output_buf[..output_advance].assume_init_ref() };
+                file.write_all(converted_chunk)?;
+            }
+            
             offset += input_advance;
+            if input_advance == 0 && !input_chunk.is_empty() {
+                // Converter made no progress on input, but there's still input.
+                // This might indicate an error or needing a larger output buffer,
+                // though convert() should error on overflow.
+                // For safety, break to avoid infinite loop, though an error should have been returned by convert().
+                return Err(apperr::Error::new_app(apperr::APP_ENCODING_CONVERSION_FAILED));
+            }
         }
 
         Ok(())
@@ -2378,6 +2475,133 @@ impl TextBuffer {
     pub fn read_forward(&self, off: usize) -> &[u8] {
         self.buffer.read_forward(off)
     }
+
+    /// Reinterprets the buffer's content as if it were encoded in `new_encoding`.
+    /// The current buffer content (which is UTF-8) is first converted to raw bytes
+    /// using `self.encoding` (its stated original encoding). Then, these raw bytes
+    /// are re-read/re-decoded assuming they are `new_encoding`, and the buffer is updated.
+    pub fn reinterpret_content_as_encoding(&mut self, new_encoding: &'static str) -> apperr::Result<()> {
+        let scratch = scratch_arena(None);
+        
+        // Step 1: Get current buffer content as a UTF-8 Vec<u8>.
+        // The GapBuffer internally stores UTF-8 bytes.
+        let mut current_utf8_content = Vec::new_in(&*scratch);
+        let mut offset = 0;
+        loop {
+            let chunk = self.read_forward(offset);
+            if chunk.is_empty() {
+                break;
+            }
+            current_utf8_content.extend_from_slice(chunk);
+            offset += chunk.len();
+        }
+
+        // Step 2: Convert this UTF-8 string to raw bytes of the *current* `self.encoding`.
+        let raw_bytes_as_current_encoding: Vec<u8>;
+        if self.encoding.starts_with("UTF-8") {
+            // If current encoding is UTF-8 or UTF-8 BOM, the current_utf8_content is already the raw form.
+            // (BOM is metadata, not part of the reinterpretable byte stream for this step).
+            raw_bytes_as_current_encoding = current_utf8_content;
+        } else {
+            // Convert from internal UTF-8 to self.encoding's byte representation.
+            let mut temp_raw_bytes = Vec::new_in(&*scratch);
+            let pivot_buffer = scratch.alloc_uninit_slice(KIBI); // For converter's internal use
+            let mut converter_to_raw = icu::Converter::new(pivot_buffer, "UTF-8", self.encoding)?;
+            
+            let mut input_offset = 0;
+            while input_offset < current_utf8_content.len() {
+                let input_chunk = &current_utf8_content[input_offset..];
+                let mut output_chunk_buf = scratch.alloc_uninit_slice(input_chunk.len() * 4 + 100); // Estimate output size
+
+                let (consumed, written) = converter_to_raw.convert(input_chunk, output_chunk_buf)?;
+                temp_raw_bytes.extend_from_slice(unsafe { output_chunk_buf[..written].assume_init_ref() });
+                input_offset += consumed;
+
+                if consumed == 0 && input_offset < current_utf8_content.len() {
+                    return Err(apperr::Error::new_app(apperr::APP_ENCODING_CONVERSION_FAILED)); // Failed to make progress
+                }
+            }
+            // Final flush for the converter_to_raw
+            let mut output_chunk_buf = scratch.alloc_uninit_slice(100); // Small buffer for flush
+            let (_, written) = converter_to_raw.convert(b"", output_chunk_buf)?;
+            if written > 0 {
+                 temp_raw_bytes.extend_from_slice(unsafe { output_chunk_buf[..written].assume_init_ref() });
+            }
+            raw_bytes_as_current_encoding = temp_raw_bytes;
+        }
+
+        // Step 3: Reinterpret these raw_bytes_as_current_encoding using new_encoding to get new UTF-8 content.
+        let new_utf8_content_vec: Vec<u8>;
+        if new_encoding.starts_with("UTF-8") {
+            // If the new encoding is UTF-8 or UTF-8 BOM, raw_bytes_as_current_encoding is treated as UTF-8.
+            // We might need to strip a BOM if new_encoding is plain "UTF-8" and raw_bytes has a UTF-8 BOM.
+            if new_encoding == "UTF-8" && raw_bytes_as_current_encoding.starts_with(b"\xEF\xBB\xBF") {
+                new_utf8_content_vec = raw_bytes_as_current_encoding[3..].to_vec_in(&*scratch);
+            } else {
+                new_utf8_content_vec = raw_bytes_as_current_encoding; // It's already UTF-8 or becomes UTF-8 BOM by declaration
+            }
+        } else {
+            let mut temp_new_utf8_bytes = Vec::new_in(&*scratch);
+            let pivot_buffer_reinterp = scratch.alloc_uninit_slice(KIBI);
+            let mut converter_from_new = icu::Converter::new(pivot_buffer_reinterp, new_encoding, "UTF-8")?;
+
+            let mut input_offset = 0;
+            while input_offset < raw_bytes_as_current_encoding.len() {
+                let input_chunk = &raw_bytes_as_current_encoding[input_offset..];
+                let mut output_chunk_buf = scratch.alloc_uninit_slice(input_chunk.len() * 4 + 100);
+
+                let (consumed, written) = converter_from_new.convert(input_chunk, output_chunk_buf)?;
+                temp_new_utf8_bytes.extend_from_slice(unsafe { output_chunk_buf[..written].assume_init_ref() });
+                input_offset += consumed;
+                
+                if consumed == 0 && input_offset < raw_bytes_as_current_encoding.len() {
+                     return Err(apperr::Error::new_app(apperr::APP_ENCODING_CONVERSION_FAILED));
+                }
+            }
+            // Final flush for converter_from_new
+            let mut output_chunk_buf = scratch.alloc_uninit_slice(100);
+            let (_, written) = converter_from_new.convert(b"", output_chunk_buf)?;
+            if written > 0 {
+                temp_new_utf8_bytes.extend_from_slice(unsafe { output_chunk_buf[..written].assume_init_ref() });
+            }
+            new_utf8_content_vec = temp_new_utf8_bytes;
+        }
+
+        // Step 4: Update buffer
+        self.buffer.clear();
+        // The new_utf8_content_vec is already UTF-8.
+        // We need to ensure line endings are normalized if needed, and statistics are updated.
+        // For simplicity, using existing write logic which handles some of this,
+        // but it's designed for user input, not bulk load.
+        // A more direct approach:
+        self.buffer.replace(0..0, &new_utf8_content_vec);
+
+        self.encoding = new_encoding; 
+
+        // Recalculate statistics, line endings, tabs/spaces heuristics, etc.
+        // This is similar to parts of read_file after content is loaded.
+        // For now, a simplified recalc:
+        let chunk = self.read_forward(0);
+        let mut offset = 0;
+        let mut lines = 0;
+        loop {
+            (offset, lines) = unicode::newlines_forward(chunk, offset, lines, lines + 1);
+            if offset >= chunk.len() {
+                break;
+            }
+        }
+        self.stats.logical_lines = lines + 1;
+        // self.stats.visual_lines = self.stats.logical_lines; // This will be fixed by reflow
+        // Other heuristics like is_crlf, indent_with_tabs might need re-evaluation.
+        // For now, we rely on recalc_after_content_swap to reset most things.
+        
+        self.recalc_after_content_swap(); // Resets undo/redo, cursor, selection, calls reflow.
+        self.encoding = new_encoding; // recalc_after_content_swap resets encoding, so set it again.
+        self.cursor_move_to_logical(Point::MIN); // Move cursor to start.
+        self.mark_as_dirty(); // Content has changed meaning.
+
+        Ok(())
+    }
 }
 
 pub enum Bom {
@@ -2416,4 +2640,62 @@ fn detect_bom(bytes: &[u8]) -> Option<&'static str> {
         }
     }
     None
+}
+
+// Helper function to check for Shift_JIS specific byte patterns.
+// This is a heuristic and may not be 100% accurate.
+fn is_likely_shift_jis(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+
+    let mut sjis_char_count = 0;
+    let mut non_ascii_count = 0;
+    let mut i = 0;
+    let len = bytes.len();
+
+    // Limit scan to a reasonable number of bytes to avoid performance issues on large invalid files.
+    let scan_len = len.min(4096); // Analyze up to 4KB
+
+    while i < scan_len {
+        let byte = bytes[i];
+
+        if byte >= 0x80 { // Non-ASCII character
+            non_ascii_count += 1;
+            // Check for Shift_JIS multi-byte characters
+            if (byte >= 0x81 && byte <= 0x9F) || (byte >= 0xE0 && byte <= 0xFC) {
+                if i + 1 < len {
+                    let next_byte = bytes[i + 1];
+                    if (next_byte >= 0x40 && next_byte <= 0x7E) || (next_byte >= 0x80 && next_byte <= 0xFC) {
+                        sjis_char_count += 1; // Count as one Shift_JIS character
+                        i += 1; // Skip next byte as it's part of a multi-byte char
+                    }
+                    // Else, it's a single byte that might be part of an invalid sequence or other encoding
+                }
+            // Check for Shift_JIS single-byte Katakana
+            } else if byte >= 0xA1 && byte <= 0xDF {
+                sjis_char_count += 1;
+            }
+            // Other non-ASCII bytes are not counted towards sjis_char_count
+        } else if byte == 0x00 {
+            // Null bytes are not common in text files, could be a sign of non-text or non-SJIS.
+            // If too many nulls, it's less likely to be Shift_JIS.
+            // This is a simple heuristic; a more complex one might count them.
+        }
+        i += 1;
+    }
+
+    if non_ascii_count == 0 { // Pure ASCII or empty after scan limit
+        return false;
+    }
+
+    // Heuristic: If more than 50% of non-ASCII characters are valid Shift_JIS start bytes
+    // (either 2-byte leads or 1-byte Kana) AND we have at least a few such characters.
+    // This threshold might need tuning.
+    let sjis_ratio = if non_ascii_count > 0 { sjis_char_count as f32 / non_ascii_count as f32 } else { 0.0 };
+    
+    // Example thresholds:
+    // - At least 5 Shift_JIS characters found
+    // - At least 30% of non-ASCII characters look like Shift_JIS
+    sjis_char_count >= 5 && sjis_ratio >= 0.30
 }

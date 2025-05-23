@@ -140,6 +140,7 @@ pub struct State {
     pub wants_statusbar_focus: bool,
     pub wants_encoding_picker: bool,
     pub wants_encoding_change: StateEncodingChange,
+    pub pending_reinterpretation_encoding: Option<&'static str>, // Added for reinterpretation flow
     pub wants_indentation_picker: bool,
     pub wants_document_picker: bool,
     pub wants_about: bool,
@@ -188,6 +189,7 @@ impl State {
             wants_statusbar_focus: false,
             wants_encoding_picker: false,
             wants_encoding_change: StateEncodingChange::None,
+            pending_reinterpretation_encoding: None, // Initialize new field
             wants_indentation_picker: false,
             wants_document_picker: false,
             wants_about: false,

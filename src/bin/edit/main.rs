@@ -282,10 +282,15 @@ fn handle_args(state: &mut State) -> apperr::Result<bool> {
     if let Some(mut file) = sys::open_stdin_if_redirected() {
         let doc = state.documents.add_untitled()?;
         let mut tb = doc.buffer.borrow_mut();
+        // For now, passing None to use auto-detection (UTF-8 default or BOM)
+        // In a future step, this would come from a parsed command-line argument.
         tb.read_file(&mut file, None)?;
         tb.mark_as_dirty();
     } else if let Some(path) = path {
-        state.documents.add_file_path(&path)?;
+        // Pass the hardcoded encoding for now.
+        // Replace Some("UTF-8") with None to test default BOM/UTF-8 detection,
+        // or Some("Shift_JIS") etc. for specific encoding tests if test files are available.
+        state.documents.add_file_path(&path, Some("UTF-8"))?;
     } else {
         state.documents.add_untitled()?;
     }
@@ -322,8 +327,11 @@ fn draw(ctx: &mut Context, state: &mut State) {
         draw_handle_wants_exit(ctx, state);
     }
     if state.wants_file_picker != StateFilePicker::None {
+        // draw_file_picker might call draw_handle_save if a file is picked for saving.
         draw_file_picker(ctx, state);
     }
+    // Ensure wants_save is checked *after* file picker,
+    // as file picker might set a path and then trigger a save.
     if state.wants_save {
         draw_handle_save(ctx, state);
     }

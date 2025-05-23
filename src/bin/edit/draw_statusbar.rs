@@ -33,7 +33,14 @@ pub fn draw_statusbar(ctx: &mut Context, state: &mut State) {
             ctx.steal_focus();
         }
 
-        state.wants_encoding_picker |= ctx.button("encoding", tb.encoding());
+        // Display the current encoding as a distinct label.
+        // This will be separate from the clickable encoding button.
+        let current_encoding_str = tb.encoding();
+        ctx.label("encoding_display", current_encoding_str);
+        // Assuming SEP (" | ") is implicitly handled by table cell gaps or needs explicit add.
+        // For now, placing it as its own cell. The table layout handles spacing.
+
+        state.wants_encoding_picker |= ctx.button("encoding_picker_button", tb.encoding()); // Button text still shows encoding for context
         if state.wants_encoding_picker {
             if doc.path.is_some() {
                 ctx.block_begin("frame");

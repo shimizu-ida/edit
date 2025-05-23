@@ -23,14 +23,21 @@ pub struct Document {
 }
 
 impl Document {
-    pub fn save(&mut self, new_path: Option<PathBuf>) -> apperr::Result<()> {
+    // Add encoding_override parameter
+    pub fn save(&mut self, new_path: Option<PathBuf>, encoding_override: Option<&'static str>) -> apperr::Result<()> {
         let path = new_path.as_deref().unwrap_or_else(|| self.path.as_ref().unwrap().as_path());
         let mut file = DocumentManager::open_for_writing(path)?;
 
         {
             let mut tb = self.buffer.borrow_mut();
-            tb.write_file(&mut file)?;
+            // Pass encoding_override to tb.write_file
+            // tb.write_file will update its own 'encoding' field if override is Some.
+            tb.write_file(&mut file, encoding_override)?;
         }
+
+        // If save was successful and an override was used,
+        // the TextBuffer's internal encoding is already updated by tb.write_file.
+        // No need to call self.buffer.borrow_mut().set_encoding() here again.
 
         if let Ok(id) = sys::file_id(None, path) {
             self.file_id = Some(id);
@@ -146,7 +153,7 @@ impl DocumentManager {
         doc.new_file_counter = new_file_counter;
     }
 
-    pub fn add_file_path(&mut self, path: &Path) -> apperr::Result<&mut Document> {
+    pub fn add_file_path(&mut self, path: &Path, encoding: Option<&'static str>) -> apperr::Result<&mut Document> {
         let (path, goto) = Self::parse_filename_goto(path);
         let path = path::normalize(path);
 
@@ -174,7 +181,8 @@ impl DocumentManager {
             tb.set_line_highlight_enabled(true);
 
             if let Some(file) = &mut file {
-                tb.read_file(file, None)?;
+                // Pass the provided encoding down to TextBuffer::read_file
+                tb.read_file(file, encoding)?;
 
                 if let Some(goto) = goto
                     && goto != Default::default()
